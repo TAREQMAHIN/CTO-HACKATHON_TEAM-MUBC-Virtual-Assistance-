@@ -1,0 +1,244 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import boto3\n",
+    "import re\n",
+    "from sagemaker import get_execution_role\n",
+    "\n",
+    "role = get_execution_role()\n",
+    "\n",
+    "bucket = 'bucket-mubc' # Enter your s3 bucket where you will copy data and model artifacts\n",
+    "prefix = 'sagemaker/chatbot' # Place to upload training files within the bucket"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "import io\n",
+    "import time\n",
+    "import json\n",
+    "import sagemaker.amazon.common as smac\n",
+    "\n",
+    "from sklearn.feature_extraction.text import TfidfTransformer\n",
+    "from sklearn.metrics.pairwise import cosine_similarity\n",
+    "from sklearn.feature_extraction.text import CountVectorizer\n",
+    "\n",
+    "import ast \n",
+    "questions = []\n",
+    "answers = [] \n",
+    "with open('qa_Electronics.json','r') as f:\n",
+    "    for line in f:\n",
+    "        data = ast.literal_eval(line)\n",
+    "        questions.append(data['question'].lower())\n",
+    "        answers.append(data['answer'].lower())"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#sm.delete_endpoint(EndpointName=linear_endpoint)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from sagemaker.amazon.amazon_estimator import get_image_uri\n",
+    "container = get_image_uri(boto3.Session().region_name, 'linear-learner')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "linear_job = 'DEMO-linear-' + time.strftime(\"%Y-%m-%d-%H-%M-%S\", time.gmtime())\n",
+    "\n",
+    "\n",
+    "\n",
+    "print(\"Job name is:\", linear_job)\n",
+    "\n",
+    "linear_training_params = {\n",
+    "    \"RoleArn\": role,\n",
+    "    \"TrainingJobName\": linear_job,\n",
+    "    \"AlgorithmSpecification\": {\n",
+    "        \"TrainingImage\": container,\n",
+    "        \"TrainingInputMode\": \"File\"\n",
+    "    },\n",
+    "    \"ResourceConfig\": {\n",
+    "        \"InstanceCount\": 1,\n",
+    "        \"InstanceType\": \"ml.c4.2xlarge\",\n",
+    "        \"VolumeSizeInGB\": 10\n",
+    "    },\n",
+    "    \"InputDataConfig\": [\n",
+    "        {\n",
+    "            \"ChannelName\": \"train\",\n",
+    "            \"DataSource\": {\n",
+    "                \"S3DataSource\": {\n",
+    "                    \"S3DataType\": \"S3Prefix\",\n",
+    "                    \"S3Uri\": \"s3://{}/{}/train/\".format(bucket, prefix),\n",
+    "                    \"S3DataDistributionType\": \"ShardedByS3Key\"\n",
+    "                }\n",
+    "            },\n",
+    "            \"CompressionType\": \"None\",\n",
+    "            \"RecordWrapperType\": \"None\"\n",
+    "        },\n",
+    "        {\n",
+    "            \"ChannelName\": \"validation\",\n",
+    "            \"DataSource\": {\n",
+    "                \"S3DataSource\": {\n",
+    "                    \"S3DataType\": \"S3Prefix\",\n",
+    "                    \"S3Uri\": \"s3://{}/{}/validation/\".format(bucket, prefix),\n",
+    "                    \"S3DataDistributionType\": \"FullyReplicated\"\n",
+    "                }\n",
+    "            },\n",
+    "            \"CompressionType\": \"None\",\n",
+    "            \"RecordWrapperType\": \"None\"\n",
+    "        }\n",
+    "\n",
+    "    ],\n",
+    "    \"OutputDataConfig\": {\n",
+    "        \"S3OutputPath\": \"s3://{}/{}/\".format(bucket, prefix)\n",
+    "    },\n",
+    "    \"HyperParameters\": {\n",
+    "        \"feature_dim\": \"30\",\n",
+    "        \"mini_batch_size\": \"100\",\n",
+    "        \"predictor_type\": \"regressor\",\n",
+    "        \"epochs\": \"10\",\n",
+    "        \"num_models\": \"32\",\n",
+    "        \"loss\": \"absolute_loss\"\n",
+    "    },\n",
+    "    \"StoppingCondition\": {\n",
+    "        \"MaxRuntimeInSeconds\": 60 * 60\n",
+    "    }\n",
+    "}"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# tokenize the text and convert data in matrix format\n",
+    "from sklearn.feature_extraction.text import CountVectorizer\n",
+    "vectorizer = CountVectorizer(stop_words='english')\n",
+    "X_vec = vectorizer.fit_transform(questions)\n",
+    "\n",
+    "# Transform data by applying term frequency inverse document frequency (TF-IDF) \n",
+    "tfidf = TfidfTransformer(norm='l2')\n",
+    "X_tfidf = tfidf.fit_transform(X_vec)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def conversation(im):\n",
+    "    global tfidf, answers, X_tfidf\n",
+    "    Y_vec = vectorizer.transform(im)\n",
+    "    Y_tfidf = tfidf.fit_transform(Y_vec)\n",
+    "    angle = np.rad2deg(np.arccos(max(cosine_similarity(Y_tfidf, X_tfidf)[0])))\n",
+    "    \n",
+    "    if angle > 60:\n",
+    "        return \"sorry, I did not quite understand that\"\n",
+    "    else:\n",
+    "        return answers[np.argmax(cosine_similarity(Y_tfidf, X_tfidf)[0])]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def main():\n",
+    "    usr = input(\"Please enter your username: \")\n",
+    "    print(\"support: Hi, welcome to Q&A support. How can I help you?\")\n",
+    "    while True:\n",
+    "        im = input(\"{}: \".format(usr))\n",
+    "        if im.lower() == 'bye':\n",
+    "            print(\"Q&A support: bye!\")\n",
+    "            break\n",
+    "        else:\n",
+    "            print(\"Q&A support: \"+conversation([im]))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Please enter your username: Shawon\n",
+      "support: Hi, welcome to Q&A support. How can I help you?\n",
+      "Shawon: how is the trimmer\n",
+      "Q&A support: i bought these for a commercial trimmer which is much larger.\n",
+      "Shawon: I want to buy trimmer\n",
+      "Q&A support: i am sure amazon has all types.\n",
+      "Shawon: suggest me a TV\n",
+      "Q&A support: tv stands for television which is a telecommunication medium for transmitting and receiving moving images that can be monochrome (black-and-white) or colored, with or without accompanying sound. \"television\" may also refer specifically to a television set, television program, or television transmission\n",
+      "Shawon: Which TV is best?\n",
+      "Q&A support: i'm not sure what you are asking. i have cable so i haven't messed with any settings.\n",
+      "Shawon: bye\n",
+      "Q&A support: bye!\n"
+     ]
+    }
+   ],
+   "source": [
+    "main()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "conda_amazonei_tensorflow2_p36",
+   "language": "python",
+   "name": "conda_amazonei_tensorflow2_p36"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.10"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
